@@ -10,7 +10,9 @@ import { CreateUserUseCase } from '../../application/use-cases/create-user.use-c
 import { CreateUserDto } from '../dtos/create-user.dto';
 import {
   ApiConflictResponse,
-  ApiCreatedResponse, ApiNotFoundResponse, ApiOkResponse,
+  ApiCreatedResponse,
+  ApiNotFoundResponse,
+  ApiOkResponse,
   ApiTags,
 } from '@nestjs/swagger';
 import { GetUserUseCase } from '../../application/use-cases/get-user.use-case';

@@ -2,7 +2,15 @@ import { Test } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from '../src/app.module';
 import request from 'supertest';
+import type { App } from 'supertest/types';
 import { getFirestore } from 'firebase-admin/firestore';
+
+interface CreatedUserResponse {
+  id: string;
+  username: string;
+  email: string;
+  password?: string;
+}
 
 async function waitFor<T>(
   fn: () => Promise<T | null>,
@@ -45,19 +53,18 @@ describe('Users (e2e)', () => {
   it('[POST] /users without password -> event auto generate hashed password', async () => {
     const email = `e2e-${Date.now()}@test.com`;
 
-    const res = await request(app.getHttpServer())
+    const res = await request(app.getHttpServer() as App)
       .post('/users')
       .send({ username: 'e2e-user', email })
       .expect(201);
 
-    expect(res.body.id).toBeDefined();
-    expect(res.body.password).toBeUndefined();
+    const body = res.body as CreatedUserResponse;
+
+    expect(body.id).toBeDefined();
+    expect(body.password).toBeUndefined();
 
     const doc = await waitFor(async () => {
-      const snap = await getFirestore()
-        .collection('users')
-        .doc(res.body.id)
-        .get();
+      const snap = await getFirestore().collection('users').doc(body.id).get();
 
       const data = snap.data();
 
@@ -71,12 +78,18 @@ describe('Users (e2e)', () => {
     const email = `dup-${Date.now()}@test.com`;
     const payload = { username: 'dup', email, password: 'Password123!' };
 
-    await request(app.getHttpServer()).post('/users').send(payload).expect(201);
-    await request(app.getHttpServer()).post('/users').send(payload).expect(409);
+    await request(app.getHttpServer() as App)
+      .post('/users')
+      .send(payload)
+      .expect(201);
+    await request(app.getHttpServer() as App)
+      .post('/users')
+      .send(payload)
+      .expect(409);
   });
 
   it('POST /users with invalid email → 400', async () => {
-    await request(app.getHttpServer())
+    await request(app.getHttpServer() as App)
       .post('/users')
       .send({ username: 'x', email: 'not-an-email' })
       .expect(400);
