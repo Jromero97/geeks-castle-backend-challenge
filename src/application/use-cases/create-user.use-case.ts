@@ -7,11 +7,14 @@ import {
   PASSWORD_GENERATOR,
   type PasswordGenerator,
 } from '../../domain/services/password-generator';
-import { EventEmitter2 } from '@nestjs/event-emitter';
 import { User } from '../../domain/entities/user.entity';
 import * as uuid from 'uuid';
 import { UserCreatedEvent } from '../../domain/events/user-created.event';
 import { EmailAlreadyExistsError } from '../../domain/errors/email-already-exists.error';
+import {
+  EVENT_PUBLISHER,
+  type EventPublisher,
+} from '../../domain/events/event-publisher';
 
 export interface CreateUserInput {
   username: string;
@@ -25,7 +28,7 @@ export class CreateUserUseCase {
     @Inject(USER_REPOSITORY) private readonly repo: UserRepository,
     @Inject(PASSWORD_GENERATOR)
     private readonly passwordGenerator: PasswordGenerator,
-    private readonly eventEmitter: EventEmitter2,
+    @Inject(EVENT_PUBLISHER) private readonly publisher: EventPublisher,
   ) {}
 
   async execute(input: CreateUserInput): Promise<User> {
@@ -45,10 +48,10 @@ export class CreateUserUseCase {
 
     const created = await this.repo.create(user);
 
-    this.eventEmitter.emit(
-      UserCreatedEvent.eventName,
-      new UserCreatedEvent(created.id, hadPassword),
-    );
+    await this.publisher.publish({
+      name: UserCreatedEvent.eventName,
+      payload: { userId: created.id, hadPassword },
+    });
 
     return created;
   }

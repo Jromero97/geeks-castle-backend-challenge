@@ -1,8 +1,8 @@
-import { EventEmitter2 } from '@nestjs/event-emitter';
 import { CreateUserUseCase } from './create-user.use-case';
 import { UserCreatedEvent } from '../../domain/events/user-created.event';
 import { User } from '../../domain/entities/user.entity';
 import { EmailAlreadyExistsError } from '../../domain/errors/email-already-exists.error';
+import { IntegrationEvent } from '../../domain/events/event-publisher';
 
 describe('CreateUserUseCase', () => {
   const repo = {
@@ -17,14 +17,15 @@ describe('CreateUserUseCase', () => {
     hash: jest.fn().mockResolvedValue('hashed-value'),
   };
 
-  const emitMock = jest.fn();
-  const emitter = { emit: emitMock } as unknown as EventEmitter2;
+  const publisher = {
+    publish: jest.fn().mockResolvedValue(undefined),
+  };
 
   let useCase: CreateUserUseCase;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    useCase = new CreateUserUseCase(repo, passwordGenerator, emitter);
+    useCase = new CreateUserUseCase(repo, passwordGenerator, publisher);
   });
 
   it('should create user without password and emit event with hadPassword = false', async () => {
@@ -34,10 +35,13 @@ describe('CreateUserUseCase', () => {
     });
     expect(repo.create).toHaveBeenCalled();
     expect(user.password).toBeUndefined();
-    expect(emitMock).toHaveBeenCalledWith(
-      UserCreatedEvent.eventName,
-      expect.objectContaining({ userId: user.id, hadPassword: false }),
-    );
+    expect(publisher.publish).toHaveBeenCalledWith({
+      name: UserCreatedEvent.eventName,
+      payload: expect.objectContaining({
+        userId: user.id,
+        hadPassword: false,
+      }) as IntegrationEvent,
+    });
   });
 
   it('should hash password when user sends it and emit hadPassword = true', async () => {
@@ -49,10 +53,12 @@ describe('CreateUserUseCase', () => {
 
     expect(passwordGenerator.hash).toHaveBeenCalledWith('MiPassword123!');
     expect(user.password).toBe('hashed-value');
-    expect(emitMock).toHaveBeenCalledWith(
-      UserCreatedEvent.eventName,
-      expect.objectContaining({ hadPassword: true }),
-    );
+    expect(publisher.publish).toHaveBeenCalledWith({
+      name: UserCreatedEvent.eventName,
+      payload: expect.objectContaining({
+        hadPassword: true,
+      }) as IntegrationEvent,
+    });
   });
 
   it('should throw EmailAlreadyExistsError, if email already exists', async () => {
@@ -63,5 +69,6 @@ describe('CreateUserUseCase', () => {
     ).rejects.toThrow(EmailAlreadyExistsError);
 
     expect(repo.create).not.toHaveBeenCalled();
+    expect(publisher.publish).not.toHaveBeenCalled();
   });
 });

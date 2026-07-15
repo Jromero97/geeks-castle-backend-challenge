@@ -151,24 +151,22 @@ POST /users (sin password)
 
 *No implementado; descripción solicitada por el challenge.*
 
-### Arquitectura propuesta
+### Arquitectura recomendada
 
 ```
 Cliente → Cloud Run (API NestJS) → Firestore
                │
-               └─ publica UserCreated → Pub/Sub → Cloud Run worker / Cloud Function
+               └─ publica UserCreated → Pub/Sub → Cloud Run worker
                                                       └─ genera password → actualiza Firestore
 ```
 
-**Cloud Run — API principal.** La aplicación se containeriza (Dockerfile multi-stage) y se despliega en Cloud Run: escalado automático (incluso a cero), HTTPS gestionado y sin administración de servidores. La autenticación con Firestore es automática a través de la service account del servicio, sin llaves en el código; la configuración va en variables de entorno y los secretos en Secret Manager.
+**Cloud Run — API principal.** La aplicación se containeriza y se despliega en Cloud Run: escalado automático (incluso a cero), HTTPS gestionado y sin administración de servidores. La autenticación con Firestore es automática a través de la service account del servicio, sin llaves en el código; los secretos se guardan en Secret Manager.
 
-**Pub/Sub — el evento en producción.** El `EventEmitter` in-process de esta solución funciona en una sola instancia, pero en producción tiene dos limitaciones: si la instancia muere después del insert y antes de procesar el evento, este se pierde; y con escalado horizontal no hay garantías de entrega. En producción, `CreateUserUseCase` publicaría el evento en un topic de Pub/Sub, que ofrece entrega *at-least-once*, reintentos con backoff y *dead-letter queue* para eventos que agotan reintentos. Gracias a Clean Architecture el cambio es acotado: se define un puerto `EventPublisher` en el dominio y se implementa un adaptador Pub/Sub en infraestructura, sin modificar los casos de uso.
+**Pub/Sub — el evento en producción.** `CreateUserUseCase` publica el evento `user.created` en un topic de Pub/Sub, que ofrece entrega *at-least-once*, reintentos con backoff y *dead-letter queue*. Gracias a Clean Architecture el cambio es acotado: se define un puerto `EventPublisher` en el dominio y se implementa un adaptador Pub/Sub en infraestructura, sin tocar los casos de uso.
 
-**Cloud Run worker (o Cloud Function) — el consumidor.** Una suscripción push de Pub/Sub entrega el evento a un endpoint del worker, que ejecuta `AssignPasswordUseCase`. Como Pub/Sub garantiza *at-least-once* (no *exactly-once*), el consumidor debe ser idempotente — exactamente el guard ya implementado en esta solución: si el usuario ya tiene password, el evento se confirma (ack) sin efectos secundarios.
+**Cloud Run worker — el consumidor.** Una suscripción push de Pub/Sub entrega el evento a un endpoint del worker, que ejecuta `AssignPasswordUseCase`. Como Pub/Sub garantiza *at-least-once*, el consumidor debe ser idempotente — exactamente el guard ya implementado: si el usuario ya tiene password, el evento se confirma (ack) sin efectos secundarios.
 
-**Alternativa considerada — trigger nativo de Firestore.** Una Cloud Function con `onDocumentCreated` también dispararía el flujo al insertar. Se descartó la variante `onWrite` porque el update del password re-dispararía el trigger (ciclo). Se prefirió emitir el evento desde la capa de aplicación para mantener la lógica de negocio fuera de la infraestructura y plenamente testeable.
-
-**CI/CD y operación.** Pipeline (GitHub Actions o Cloud Build) con lint + pruebas + build de imagen → Artifact Registry → deploy a Cloud Run. Observabilidad con Cloud Logging/Monitoring (incluidos en Cloud Run) y alertas sobre la dead-letter queue de Pub/Sub.
+**CI/CD y operación.** Pipeline (GitHub Actions o Cloud Build) con lint + pruebas + build de imagen → Artifact Registry → deploy a Cloud Run. Observabilidad con Cloud Logging/Monitoring y alertas sobre la dead-letter queue de Pub/Sub.
 
 ## Mejoras futuras
 

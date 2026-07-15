@@ -47,7 +47,7 @@ describe('Users (e2e)', () => {
   });
 
   afterAll(async () => {
-    await app.close();
+    if (app) await app.close();
   });
 
   it('[POST] /users without password -> event auto generate hashed password', async () => {
