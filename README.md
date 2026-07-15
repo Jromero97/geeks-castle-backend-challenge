@@ -35,6 +35,12 @@ Variables de entorno (`.env`):
 |---|---|---|
 | `FIREBASE_PROJECT_ID` | ID del proyecto Firebase. Con el emulador puede ser cualquier string. | `challenge-backend-demo` |
 | `FIRESTORE_EMULATOR_HOST` | Host del emulador. Si está definida, el Admin SDK se conecta al emulador sin credenciales de Google Cloud. | `localhost:8080` |
+| `EVENT_TRANSPORT` | Feature flag del transporte de eventos: `local` o `pubsub`. Ver [Transporte de eventos](#transporte-de-eventos-feature-flag). | `local` |
+| `LISTENER_MAX_RETRIES` | (modo local) Reintentos del listener ante fallo transitorio antes de ir a dead-letter. | `3` |
+| `LISTENER_RETRY_BASE_MS` | (modo local) Base del backoff exponencial entre reintentos, en ms. | `200` |
+| `GOOGLE_CLOUD_PROJECT` | (modo pubsub) Proyecto de GCP / del emulador de Pub/Sub. | `challenge-backend-demo` |
+| `PUBSUB_TOPIC_USER_CREATED` | (modo pubsub) Topic donde se publica `user.created`. | `user-created` |
+| `PUBSUB_PUSH_TOKEN` | (modo pubsub) Secreto compartido que valida el push entrante al controlador. | `local-secret` |
 
 ## Ejecución
 
@@ -81,7 +87,9 @@ pnpm test:cov    # unitarias con reporte de cobertura
 pnpm test:e2e    # end-to-end (REQUIEREN el emulador corriendo)
 ```
 
-Las pruebas unitarias cubren las funcionalidades principales: generación segura de contraseñas (longitud, diversidad de caracteres, unicidad, hash verificable), el caso de uso de creación (con y sin password, email duplicado), la asignación idempotente de contraseñas y la resiliencia del listener. Las pruebas e2e validan el flujo completo contra el emulador: creación → evento → hash bcrypt persistido, conflicto por email duplicado (409) y validación de entrada (400).
+Las pruebas unitarias cubren las funcionalidades principales: generación segura de contraseñas (longitud, diversidad de caracteres, unicidad, hash verificable), el caso de uso de creación (con y sin password, email duplicado, publicación del evento), la asignación idempotente de contraseñas, la utilidad de reintentos (backoff) y el listener (reintento → éxito, y agotamiento → dead-letter). Las pruebas e2e validan el flujo completo contra el emulador: creación → evento → hash bcrypt persistido, conflicto por email duplicado (409) y validación de entrada (400).
+
+Guías paso a paso para ejercitar cada transporte manualmente: [docs/local-mode.md](docs/local-mode.md) (modo `local`, incluye reintentos y dead-letter) y [docs/pubsub-local.md](docs/pubsub-local.md) (modo `pubsub` contra el emulador de Pub/Sub).
 
 ## Arquitectura
 
@@ -100,16 +108,19 @@ src/
 │   ├── entities/           #   User
 │   ├── repositories/       #   UserRepository (puerto)
 │   ├── services/           #   PasswordGenerator (puerto)
-│   ├── events/             #   UserCreatedEvent
+│   ├── events/             #   UserCreatedEvent, EventPublisher, DeadLetterStore (puertos)
 │   └── errors/             #   EmailAlreadyExistsError
 ├── application/            # Orquestación de casos de uso
 │   ├── use-cases/          #   CreateUser, AssignPassword, GetUser
-│   └── listeners/          #   UserCreatedListener
+│   ├── listeners/          #   UserCreatedListener (retry + dead-letter)
+│   └── common/             #   retry (backoff exponencial + jitter)
 ├── infraestructure/        # Adaptadores concretos
 │   ├── firebase/           #   FirebaseModule + repositorio Firestore
-│   └── security/           #   CryptoPasswordGenerator (crypto + bcrypt)
+│   ├── security/           #   CryptoPasswordGenerator (crypto + bcrypt)
+│   ├── messaging/          #   EventsModule (flag) + publishers local/pubsub + dead-letter
+│   └── shared.module.ts    #   Bindings globales (UserRepository, PasswordGenerator)
 └── presentation/           # Capa HTTP
-    ├── controllers/        #   UserController
+    ├── controllers/        #   UserController, PubSubPushController
     ├── dtos/               #   CreateUserDto (class-validator + Swagger)
     └── filters/            #   DomainExceptionFilter (dominio → HTTP)
 ```
@@ -138,7 +149,22 @@ POST /users (sin password)
 
 - **Idempotencia**: el guard del paso 2 usa el estado persistido (no memoria del proceso) como fuente de verdad. Procesar el mismo evento N veces produce el mismo resultado que procesarlo una vez: un password ya asignado jamás se sobrescribe. Está cubierto por pruebas unitarias.
 - **Sin ciclos**: el evento se emite una única vez, en la capa de aplicación y solo en la creación. La actualización del password (`updatePassword`) no emite ningún evento, por lo que no puede re-disparar el flujo. Si en su lugar se usara un trigger de infraestructura sobre escrituras (p. ej. `onWrite` de Firestore), el propio update re-dispararía el trigger; incluso en ese escenario, el guard de idempotencia rompería el ciclo. Emitir desde la capa de aplicación fue una decisión deliberada: mantiene la lógica en código testeable y evita el problema por diseño.
-- **Resiliencia**: el listener envuelve su ejecución en try/catch con logging. Una excepción en un listener asíncrono de `@nestjs/event-emitter` tumbaría el proceso si no se captura.
+- **Resiliencia (modo local)**: el listener reintenta con backoff exponencial + jitter ante fallos transitorios; si los agota, persiste el evento fallido en la colección `dead_letter_events` de Firestore para inspección/reproceso. Todo dentro de un try/catch: una excepción sin capturar en un listener asíncrono de `@nestjs/event-emitter` tumbaría el proceso.
+
+## Transporte de eventos (feature flag)
+
+El transporte del evento `user.created` es conmutable mediante la variable `EVENT_TRANSPORT`, **sin tocar los casos de uso**. `CreateUserUseCase` depende de un puerto `EventPublisher` (dominio) y cada modo aporta su adaptador (infraestructura):
+
+| Modo | Publicación | Consumo | Reintentos | Dead-letter |
+|---|---|---|---|---|
+| `local` (default) | `EventEmitter2` en proceso | `UserCreatedListener` (`@OnEvent`) | backoff exponencial + jitter en el listener | colección `dead_letter_events` (Firestore) |
+| `pubsub` | topic de Pub/Sub (`@google-cloud/pubsub`) | suscripción push → `PubSubPushController` | nativos de Pub/Sub | dead-letter topic de Pub/Sub |
+
+`EventsModule.forRoot()` (dynamic module) es la **única fuente de verdad** del flag: según `EVENT_TRANSPORT` registra el publisher, el consumidor y —en local— el almacén de dead-letter. `AssignPasswordUseCase` es el mismo caso de uso en ambos caminos; su guard de idempotencia hace seguro tanto el reintento local como la entrega *at-least-once* de Pub/Sub.
+
+> **Nota (dual-write)**: el evento se publica después de escribir en Firestore. Si la escritura tiene éxito pero la publicación falla, el evento se pierde (problema clásico de *dual write*). La mitigación aquí es la idempotencia + *at-least-once*; la solución completa sería un *transactional outbox* (ver [Mejoras futuras](#mejoras-futuras)).
+
+Para ejercitar el modo `pubsub` contra el emulador de Pub/Sub en local, ver [docs/pubsub-local.md](docs/pubsub-local.md).
 
 ## Decisiones técnicas
 
@@ -149,7 +175,9 @@ POST /users (sin password)
 
 ## Despliegue en GCP (propuesta productiva)
 
-*No implementado; descripción solicitada por el challenge.*
+*El despliegue (Cloud Run, service accounts, Secret Manager) no está implementado. El **transporte Pub/Sub del evento sí**: es seleccionable con `EVENT_TRANSPORT=pubsub` y se prueba en local contra el emulador (ver [Transporte de eventos](#transporte-de-eventos-feature-flag)).*
+
+> Diagramas de la arquitectura, la secuencia del evento, el flujo de reintentos/dead-letter y el CI/CD en [docs/gcp-architecture.md](docs/gcp-architecture.md).
 
 ### Arquitectura recomendada
 
@@ -162,7 +190,7 @@ Cliente → Cloud Run (API NestJS) → Firestore
 
 **Cloud Run — API principal.** La aplicación se containeriza y se despliega en Cloud Run: escalado automático (incluso a cero), HTTPS gestionado y sin administración de servidores. La autenticación con Firestore es automática a través de la service account del servicio, sin llaves en el código; los secretos se guardan en Secret Manager.
 
-**Pub/Sub — el evento en producción.** `CreateUserUseCase` publica el evento `user.created` en un topic de Pub/Sub, que ofrece entrega *at-least-once*, reintentos con backoff y *dead-letter queue*. Gracias a Clean Architecture el cambio es acotado: se define un puerto `EventPublisher` en el dominio y se implementa un adaptador Pub/Sub en infraestructura, sin tocar los casos de uso.
+**Pub/Sub — el evento en producción.** `CreateUserUseCase` publica el evento `user.created` en un topic de Pub/Sub, que ofrece entrega *at-least-once*, reintentos con backoff y *dead-letter queue*. Gracias a Clean Architecture el cambio fue acotado y ya está implementado: el puerto `EventPublisher` vive en el dominio y el adaptador `PubSubEventPublisher` en infraestructura, sin tocar los casos de uso.
 
 **Cloud Run worker — el consumidor.** Una suscripción push de Pub/Sub entrega el evento a un endpoint del worker, que ejecuta `AssignPasswordUseCase`. Como Pub/Sub garantiza *at-least-once*, el consumidor debe ser idempotente — exactamente el guard ya implementado: si el usuario ya tiene password, el evento se confirma (ack) sin efectos secundarios.
 
@@ -172,5 +200,6 @@ Cliente → Cloud Run (API NestJS) → Firestore
 
 - Transacción de Firestore para eliminar la condición de carrera del email único.
 - Header `Idempotency-Key` en el `POST /users` para que reintentos del cliente no generen intentos duplicados.
-- Reintentos con backoff / dead-letter para el listener local (resuelto de forma nativa por Pub/Sub en la propuesta de GCP).
+- *Transactional outbox* para eliminar el problema de *dual write* al publicar el evento (hoy mitigado con idempotencia + at-least-once).
+- Endpoint/worker de reproceso que relea la colección `dead_letter_events` y reemita los eventos fallidos.
 - Ejecución de las pruebas e2e en CI usando `firebase emulators:exec`.

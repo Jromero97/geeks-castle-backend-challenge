@@ -1,6 +1,5 @@
 import { Test } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
-import { AppModule } from '../src/app.module';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { getFirestore } from 'firebase-admin/firestore';
@@ -31,7 +30,12 @@ describe('Users (e2e)', () => {
   let app: INestApplication;
 
   beforeAll(async () => {
+    process.env.EVENT_TRANSPORT = 'local';
     process.env.FIRESTORE_EMULATOR_HOST ??= 'localhost:8080';
+
+    const { AppModule } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/app.module') as typeof import('../src/app.module');
 
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
@@ -48,6 +52,7 @@ describe('Users (e2e)', () => {
 
   afterAll(async () => {
     if (app) await app.close();
+    delete process.env.EVENT_TRANSPORT;
   });
 
   it('[POST] /users without password -> event auto generate hashed password', async () => {
